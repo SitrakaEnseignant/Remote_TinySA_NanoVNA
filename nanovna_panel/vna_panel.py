@@ -1,5 +1,6 @@
 """
-NanoVNA-F V3 Front Panel - bench-VNA style remote control.
+NanoVNA Front Panel - bench-VNA style remote control for the NanoVNA-F V3, the NanoVNA-H4, the NanoVNA SAA2
+and the LiteVNA 64.
 
 Run:  python vna_panel.py            (auto-detects the NanoVNA COM port)
       python vna_panel.py --sim      (built-in simulator with a 1 GHz bandpass DUT)
@@ -19,11 +20,14 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel,
                              QVBoxLayout, QGridLayout, QComboBox, QFileDialog, QMessageBox,
                              QInputDialog, QDialog, QPlainTextEdit, QPushButton, QSizePolicy)
 
-from vna_device import VNAWorker, list_ports, SIM_PORT, MODELS, DEFAULT_MODEL
+from vna_device import (VNAWorker, list_ports, SIM_PORT, SIM_SAA2_PORT, SIM_LITE_PORT, SIM_PORTS, SHELL_CAPS,
+                        FMIN, FMAX, MODELS, GENERIC, AUTO_MODEL, DEFAULT_MODEL, KIND_MODEL, shell_model)
+from saa2_device import POWER_DESC, ecal_problem
 from vna_cal import Calibration, interp_c
 from vna_widgets import PanelButton, Knob, PowerBar, PortConnector, ClickFrame, DPadCenter
 
-APP_NAME = "NanoVNA-F V3 Front Panel"
+APP_NAME = GENERIC["title"]               # "NanoVNA Front Panel" until an instrument is chosen
+V2_KINDS = ("saa2", "litevna")            # binary-protocol instruments (saa2_device.py, litevna64_device.py)
 SLOTS = 8
 C0 = 299792458.0
 TRACE_COLORS = ["#f2e53d", "#3fd0e0", "#e040e0", "#3f8fff"]
@@ -369,14 +373,16 @@ class VNAPanel(QMainWindow):
     def __init__(self, args):
         super().__init__()
         self.args = args
-        self.model = DEFAULT_MODEL
-        self.fmin, self.fmax = MODELS[self.model]["fmin"], MODELS[self.model]["fmax"]
-        self.setWindowTitle(MODELS[self.model]["title"])
+        self.model = DEFAULT_MODEL            # Model list: "Auto" or an instrument name
+        self.setWindowTitle(APP_NAME)
         self.worker = None
         self.is_sim = False
+        self.caps = dict(SHELL_CAPS)      # replaced by the device's capabilities on connect
+        self.fmin, self.fmax = FMIN, FMAX
+        self.tx_power = 3                 # NanoVNA SAA2: ADF4350 level 0..3 (3 = max)
 
         # channel state
-        self.start, self.stop = MODELS[self.model]["preset"]
+        self.start, self.stop = GENERIC["preset"]
         self.points = 201
         self.chunk = 201
         self.running = True
@@ -425,8 +431,9 @@ class VNAPanel(QMainWindow):
         self.clock.start(1000)
 
         self.refresh_ports()
-        if args.sim:
-            self.port_combo.setCurrentIndex(self.port_combo.findData(SIM_PORT))
+        if args.sim or args.sim_saa2 or args.sim_lite:
+            sim = SIM_LITE_PORT if args.sim_lite else SIM_SAA2_PORT if args.sim_saa2 else SIM_PORT
+            self.port_combo.setCurrentIndex(self.port_combo.findData(sim))
             QTimer.singleShot(100, self.connect_device)
         elif args.port:
             i = self.port_combo.findData(args.port)
@@ -455,14 +462,15 @@ class VNAPanel(QMainWindow):
         top = QHBoxLayout()
         b = QLabel("NanoVNA")
         b.setObjectName("brand")
-        m = QLabel(MODELS[self.model]["label"])
+        m = QLabel("")
         m.setObjectName("model")
-        self.model_lbl = m
         t = QLabel("      Vector Network Analyzer      ")
         t.setObjectName("tag")
-        r = QLabel(MODELS[self.model]["range"])
+        r = QLabel("")
         r.setObjectName("range")
-        self.range_lbl = r
+        r.hide()                              # shown once an instrument is selected
+        self.brand_lbl, self.model_lbl, self.range_lbl = b, m, r
+        self.brand = None
         for w in (b, m, t, r):
             top.addWidget(w)
         top.addStretch(1)
@@ -490,6 +498,7 @@ class VNAPanel(QMainWindow):
         row = QHBoxLayout()
         self.port_combo = QComboBox()
         self.port_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+        self.port_combo.activated.connect(lambda i: self.preview_brand())
         row.addWidget(self.port_combo)
         rb = PanelButton("⟳", "key", w=36)
         rb.setStyleSheet("min-width:30px;")
@@ -501,7 +510,7 @@ class VNAPanel(QMainWindow):
         col.addWidget(l2)
         self.model_combo = QComboBox()
         self.model_combo.setFocusPolicy(Qt.FocusPolicy.NoFocus)
-        self.model_combo.addItems(list(MODELS))
+        self.model_combo.addItems([AUTO_MODEL] + list(MODELS))
         self.model_combo.setCurrentText(self.model)
         self.model_combo.currentTextChanged.connect(self.set_model)
         col.addWidget(self.model_combo)
@@ -534,6 +543,7 @@ class VNAPanel(QMainWindow):
         tl.setSpacing(4)
         lg = QLabel("NanoVNA")
         lg.setObjectName("logo")
+        self.logo_lbl = lg
         tl.addWidget(lg)
         for text, tip, fn in (("Tr+", "Next trace", self.next_trace),
                               ("▦", "Layout 1/2/4 traces", self.cycle_layout),
@@ -770,7 +780,7 @@ class VNAPanel(QMainWindow):
                             lambda n: self.set_points(self.points + 10 * n),
                             lambda up: self.set_points(self.points * 2 if up else self.points // 2)),
             "chunk": Param("Segment", lambda: self.chunk, self.set_chunk, lambda v: "%d pts" % v,
-                           lambda n: self.set_chunk(self.chunk + 10 * n), lambda up: self.set_chunk(801 if up else 101)),
+                           lambda n: self.set_chunk(self.chunk + 10 * n), lambda up: self.set_chunk(self.max_chunk() if up else 101)),
             "avg": Param("Avg Factor", lambda: self.avg_n, self.set_avg_n, lambda v: "%d" % v,
                          lambda n: self.set_avg_n(self.avg_n + n),
                          lambda up: self.set_avg_n(self.avg_n * 2 if up else self.avg_n // 2)),
@@ -835,7 +845,7 @@ class VNAPanel(QMainWindow):
         M["AVG"] = ("Average / BW", [tog("Averaging", lambda: self.avg_on, self.set_avg_on), prm("Avg Factor", "avg"),
                                      act("Avg Restart", self.restart_avg, value=lambda: "%d/%d" % (self.avg_count, self.avg_n)),
                                      tog("Smoothing", lambda: T().smooth, self.set_smooth), prm("Smo Aperture", "aperture"),
-                                     act("IF BW", lambda: self.flash("IF bandwidth is fixed by the NanoVNA-F firmware"), value=lambda: "device")])
+                                     act("IF BW", lambda: self.flash("IF bandwidth is fixed by the device firmware"), value=lambda: "device")])
         M["TRACE"] = ("Trace", [choice("Active Trace", ["1", "2", "3", "4"], lambda: str(self.at + 1),
                                        lambda v: self.select_trace(int(v) - 1)),
                                 choice("Meas", ["S11", "S21"], lambda: T().sparam, self.set_sparam),
@@ -851,7 +861,7 @@ class VNAPanel(QMainWindow):
         M["PORTEXT"] = ("Port Extension", [prm("Elec Delay", "delay"), act("Auto Delay", self.auto_delay),
                                            act("Delay 0", lambda: self.params["delay"].set(0.0)),
                                            prm("Phase Offset", "phoff"), prm("Velocity Fac", "vf"),
-                                           act("Power", lambda: self.flash("Source power is fixed on the NanoVNA-F"), value=lambda: "fixed")])
+                                           act("Power", self.cycle_power, value=self.power_label)])
         M["SWEEP"] = ("Sweep", [prm("Points", "points"), prm("Segment", "chunk"),
                                 act("Sweep Time", lambda: None, value=lambda: "%.2f s" % self.swt),
                                 prm("Start", "start"), prm("Stop", "stop")])
@@ -1136,11 +1146,13 @@ class VNAPanel(QMainWindow):
         return v
 
     def set_range(self, a, b):
-        a = max(self.fmin, min(a, self.fmax))
-        b = max(self.fmin, min(b, self.fmax))
+        lo, hi = self.fmin, self.fmax
+        a = max(lo, min(a, hi))
+        b = max(lo, min(b, hi))
         if b - a < 10e3:
             c = (a + b) / 2
-            a, b = max(self.fmin, c - 5e3), max(self.fmin, c - 5e3) + 10e3
+            a = max(lo, min(c - 5e3, hi - 10e3))
+            b = a + 10e3
         self.start, self.stop = a, b
         self.push_sweep()
 
@@ -1162,10 +1174,106 @@ class VNAPanel(QMainWindow):
         self.points = int(max(11, min(v, 1601)))
         self.push_sweep()
 
+    def max_chunk(self):
+        return self.caps["max_points"] if self.caps["kind"] in V2_KINDS else 801
+
     def set_chunk(self, v):
-        self.chunk = int(max(11, min(v, 801)))
+        self.chunk = int(max(11, min(v, self.max_chunk())))
         if self.worker:
             self.worker.set_chunk(self.chunk)
+
+    def model_info(self):
+        """Settings of the instrument shown (MODELS entry), GENERIC while it is unknown."""
+        return MODELS.get(self.brand, GENERIC)
+
+    def device_title(self):
+        """Window / file-header name: generic until an instrument is chosen; for the NanoVNA-F V3 the original
+        "NanoVNA-F V3 Front Panel"; for a SAA2 / LiteVNA its board and firmware once connected."""
+        title = self.model_info()["title"]
+        if self.brand in KIND_MODEL.values() and self.worker is not None and "detail" in self.caps:
+            title += " - " + self.caps["detail"]
+        return title
+
+    def set_brand(self, brand):
+        """Show an instrument: brand = MODELS key, or None for the generic name."""
+        self.brand = brand
+        m = self.model_info()
+        self.brand_lbl.setText(m["logo"])
+        self.logo_lbl.setText(m["logo"])
+        self.model_lbl.setText(m["label"])
+        self.range_lbl.setText(m["range"])
+        self.range_lbl.setVisible(bool(m["range"]))
+        self.setWindowTitle(self.device_title())
+
+    def sync_model_combo(self, name):
+        self.model = name
+        self.model_combo.blockSignals(True)
+        self.model_combo.setCurrentText(name)
+        self.model_combo.blockSignals(False)
+
+    def set_model(self, name):
+        """Model list (upstream PR #2): shows the instrument, its range and its preset sweep.  A SAA2 / LiteVNA
+        identifies itself, so while one is connected the list follows it; F-V3 / H4 are told apart here."""
+        if name != AUTO_MODEL and name not in MODELS:
+            return
+        kind = self.caps["kind"] if self.worker is not None else None
+        if kind in V2_KINDS:
+            if name not in (AUTO_MODEL, KIND_MODEL[kind]):
+                self.flash("The connected instrument identified itself as a %s" % KIND_MODEL[kind])
+                self.sync_model_combo(self.model)
+                return
+            self.model = name
+            return
+        if kind is not None and name != AUTO_MODEL and MODELS[name]["protocol"] != "shell":
+            self.flash("A text-protocol NanoVNA is connected (F-V3 / H4); the SAA2 and the LiteVNA are detected by themselves")
+            self.sync_model_combo(self.model)
+            return
+        self.model = name
+        if name == AUTO_MODEL:
+            if kind is None:
+                self.set_brand(None)
+                self.fmin, self.fmax = GENERIC["fmin"], GENERIC["fmax"]
+            else:
+                self.show_device_brand()
+            self.set_range(self.start, self.stop)
+            self.flash("Model: Auto (named when the instrument is connected)")
+            return
+        m = MODELS[name]
+        self.set_brand(name)
+        self.fmin, self.fmax = m["fmin"], m["fmax"]
+        if self.worker:
+            self.worker.screen = m["screen"]
+        self.set_range(*m["preset"])
+        self.flash("Model: %s  (%s)" % (name, m["range"]))
+
+    def preview_brand(self):
+        """Port chosen in the list on "Auto" (not connected): name the simulators; real ports stay generic until
+        the instrument answers (F-V3 / H4 share a USB id, so do SAA2 / LiteVNA)."""
+        if self.worker is not None or self.model != AUTO_MODEL:
+            return
+        sims = {SIM_PORT: "NanoVNA-F V3", SIM_SAA2_PORT: "NanoVNA SAA2", SIM_LITE_PORT: "LiteVNA 64"}
+        self.set_brand(sims.get(self.port_combo.currentData()))
+
+    def show_device_brand(self):
+        """Connected: SAA2 / LiteVNA from their identity registers; a text-protocol NanoVNA from the Model list,
+        or on "Auto" from its "version" reply (NanoVNA-F V3 when it does not say)."""
+        kind = self.caps["kind"]
+        if kind in V2_KINDS:
+            name = KIND_MODEL[kind]
+            self.fmin, self.fmax = self.caps["fmin"], self.caps["fmax"]
+            if self.model not in (AUTO_MODEL, name):
+                self.sync_model_combo(name)
+        else:
+            if self.model in MODELS and MODELS[self.model]["protocol"] == "shell":
+                name = self.model
+            else:
+                name = shell_model(getattr(self, "version", "")) or "NanoVNA-F V3"
+                if self.model != AUTO_MODEL:
+                    self.sync_model_combo(name)
+            m = MODELS[name]
+            self.fmin, self.fmax = m["fmin"], m["fmax"]
+            self.worker.screen = m["screen"]
+        self.set_brand(name)
 
     def push_sweep(self):
         self.restart_avg()
@@ -1490,6 +1598,9 @@ class VNAPanel(QMainWindow):
 
     # calibration -------------------------------------------------------
     def set_correction(self, c):
+        if c == "Device" and not self.caps["device_cal"]:
+            self.flash("This device sends raw data over USB - use Correction = App (measure Open/Short/Load/Thru)", 6000)
+            return
         if c == "App" and self.cal.terms is None:
             self.flash("No app calibration yet - measure standards, then Done/Apply")
             return
@@ -1577,6 +1688,9 @@ class VNAPanel(QMainWindow):
             self.render_menu()
 
     def device_recall(self):
+        if not self.caps["slots"]:
+            self.flash("Device save/recall slots are not reachable over USB on this instrument")
+            return
         n, ok = QInputDialog.getInt(self, "Recall", "Recall device cal/state slot (0-6):", 0, 0, 6)
         if ok:
             self.send("recall %d" % n)
@@ -1584,9 +1698,24 @@ class VNAPanel(QMainWindow):
             self.flash("Recalled slot %d (device sweep settings changed; app sweep unchanged)" % n)
 
     def device_save(self):
+        if not self.caps["slots"]:
+            self.flash("Device save/recall slots are not reachable over USB on this instrument")
+            return
         n, ok = QInputDialog.getInt(self, "Save", "Save device cal/state to slot (0-6):", 0, 0, 6)
         if ok:
             self.send("save %d" % n)
+
+    def power_label(self):
+        return POWER_DESC[self.tx_power] if self.caps.get("power") else "fixed"
+
+    def cycle_power(self):
+        if not self.caps.get("power"):
+            self.flash("Source power is fixed on this device / firmware")
+            return
+        self.tx_power = (self.tx_power - 1) % 4          # max -> -3 -> -6 -> -9 dB -> max
+        self.send("power %d" % self.tx_power)
+        self.flash("TX power %s (ADF4350, applies above 140 MHz)" % POWER_DESC[self.tx_power])
+        self.render_menu()
 
     def set_sim_dut(self, d):
         self.sim_dut = d
@@ -1598,27 +1727,15 @@ class VNAPanel(QMainWindow):
         cur = self.port_combo.currentData()
         self.port_combo.clear()
         best = -1
-        for dev, desc, is_v in list_ports():
-            self.port_combo.addItem(dev + ("  (NanoVNA)" if is_v else ""), dev)
-            if is_v and best < 0:
+        for dev, desc, label in list_ports():
+            self.port_combo.addItem(dev + ("  (%s)" % label if label else ""), dev)
+            if label and best < 0:
                 best = self.port_combo.count() - 1
         self.port_combo.addItem(SIM_PORT, SIM_PORT)
+        self.port_combo.addItem(SIM_SAA2_PORT, SIM_SAA2_PORT)
+        self.port_combo.addItem(SIM_LITE_PORT, SIM_LITE_PORT)
         i = self.port_combo.findData(cur) if cur else -1
         self.port_combo.setCurrentIndex(i if i >= 0 else max(best, 0))
-
-    def set_model(self, name):
-        if name not in MODELS:
-            return
-        m = MODELS[name]
-        self.model = name
-        self.fmin, self.fmax = m["fmin"], m["fmax"]
-        self.model_lbl.setText(m["label"])
-        self.range_lbl.setText(m["range"])
-        self.setWindowTitle(m["title"])
-        if self.worker:
-            self.worker.screen = m["screen"]
-        self.set_range(*m["preset"])
-        self.flash("Model: %s  (%s)" % (name, m["range"]))
 
     def toggle_connect(self):
         if self.worker:
@@ -1630,13 +1747,14 @@ class VNAPanel(QMainWindow):
         if self.worker:
             return
         port = self.port_combo.currentData()
-        self.is_sim = port == SIM_PORT
-        w = VNAWorker(port, MODELS[self.model]["screen"])
+        self.is_sim = port in SIM_PORTS
+        w = VNAWorker(port, MODELS.get(self.model, GENERIC)["screen"],
+                      proto="litevna" if self.args.litevna else "saa2" if self.args.saa2 else "auto")
         w.sweep_ready.connect(self.on_sweep)
         w.connected.connect(self.on_connected)
         w.disconnected.connect(self.on_disconnected)
         w.reply.connect(self.on_reply)
-        w.status.connect(self.flash)
+        w.status.connect(self.on_status)
         w.set_sweep(self.start, self.stop, self.points)
         w.set_chunk(self.chunk)
         w.set_running(self.running)
@@ -1660,10 +1778,26 @@ class VNAPanel(QMainWindow):
         if self.sender() is not self.worker:
             return
         self.version = ver.splitlines()[0] if ver else "NanoVNA"
+        self.caps = dict(self.worker.caps)
+        self.fmin, self.fmax = self.caps["fmin"], self.caps["fmax"]
+        msg = "Connected: %s" % self.version
+        if not self.caps["device_cal"] and self.correction == "Device":
+            self.correction = "App" if self.cal.terms is not None else "Off"
+            msg += "  -  raw USB data: calibrate with Cal -> Open/Short/Load/Thru, then Done/Apply"
+        if self.caps.get("power") and self.caps.get("tx_power") is not None:
+            self.tx_power = self.caps["tx_power"]            # keep the level set on the device
+        if self.caps["kind"] in V2_KINDS:
+            # every sweep-register write makes the SAA2 re-measure its internal ecal (main2.cpp
+            # cmdRegisterWrite): sweep in one segment so the registers are written once, not per segment
+            self.set_chunk(self.max_chunk())
+        elif self.chunk > 801:
+            self.set_chunk(201)
+        self.show_device_brand()
+        self.set_range(self.start, self.stop)         # clamp to this device's range
         self.send("cal on" if self.correction == "Device" else "cal off")
         if self.is_sim:
             self.send("simdut %s" % self.sim_dut)
-        self.flash("Connected: %s" % self.version)
+        self.flash(msg, 8000)
         self.render_menu()
         self.update_status()
 
@@ -1678,6 +1812,10 @@ class VNAPanel(QMainWindow):
         self.power.setChecked(False)
         self.flash(reason, 8000)
         self.render_menu()
+        self.update_status()
+
+    def on_status(self, text):
+        self.flash(text, 12000 if text.startswith("SAA2:") else 4000)
         self.update_status()
 
     def send(self, cmd, cb=None):
@@ -1700,7 +1838,13 @@ class VNAPanel(QMainWindow):
             self.flash("Not connected")
             return
         self.send("version", lambda a: self.send("info", lambda b: self.send(
-            "SN", lambda c: self.text_dialog("Device info", "%s\n\n%s\n\nSN: %s" % (a, b, c)))))
+            "SN", lambda c: self.text_dialog("Device info", "%s\n\n%s\n\nSN: %s%s" % (a, b, c, self.retry_text())))))
+
+    def retry_text(self):
+        w = self.worker
+        if not w or not w.retries:
+            return ""
+        return "\n\nSweep retries this session: %d (last: %s)" % (w.retries, w.last_error)
 
     def console(self):
         if not self.worker:
@@ -1724,6 +1868,9 @@ class VNAPanel(QMainWindow):
     def device_capture(self):
         if not self.worker:
             self.flash("Not connected")
+            return
+        if not self.caps["capture"]:
+            self.flash("Screen capture is not available on this device / firmware (SAA2: firmware 1.2 or later)")
             return
         self.flash("Capturing device screen…")
         token = self.next_token
@@ -1778,8 +1925,8 @@ class VNAPanel(QMainWindow):
         if not fn:
             return
         with open(fn, "w") as fh:
-            fh.write("! " + MODELS[self.model]["title"] + "  %s  correction=%s %s\n" %
-                     (datetime.datetime.now().isoformat(timespec="seconds"), self.correction,
+            fh.write("! %s  %s  correction=%s %s\n" %
+                     (self.device_title(), datetime.datetime.now().isoformat(timespec="seconds"), self.correction,
                       self.cal.kind() if self.correction == "App" else ""))
             if ports == 2:
                 fh.write("! 1.5-port VNA: S12 and S22 not measured (written as 0)\n")
@@ -2031,9 +2178,13 @@ class VNAPanel(QMainWindow):
         avg = ("Avg %d/%d" % (self.avg_count, self.avg_n)) if self.avg_on else "Avg Off"
         trig = "Continuous" if self.running else "Hold"
         parts = ["Tr %d" % (self.at + 1), "Ch 1", "Internal Trig", trig, avg, cal,
-                 "%d pts" % self.points, "SWT %.2f s" % self.swt]
+                 "%d pts" % self.points, "SWT %.2f s" % self.swt, "Sweep #%d" % self.sweeps]
         if self.acq:
             parts.append("<span style='color:#ffd166'>Measuring %s</span>" % self.acq["name"].upper())
+        w = self.worker
+        if w is not None and ecal_problem(w.stuck_points, self.points):
+            parts.append("<span style='color:#ff5050'>SAA2 not in ECAL mode: %d pts stuck at S11=1</span>"
+                         % w.stuck_points)
         self.st_left.setText("&nbsp;|&nbsp;".join(parts))
         if self.worker:
             dev = "<span style='color:#3ecf8e'>● %s</span>" % ("SIM" if self.is_sim else getattr(self, "version", "Online"))
@@ -2055,18 +2206,23 @@ class VNAPanel(QMainWindow):
         self.avg_on = False
         self.set_running(True)
         self.relayout()
-        self.set_range(*MODELS[self.model]["preset"])
+        self.set_range(*self.model_info()["preset"])
         self.set_points(201)
         self.open_menu("FREQ")
         self.flash("Preset (app calibration kept)")
 
     def show_help(self):
         QMessageBox.information(self, "Help", (
-            "<b>NanoVNA-F V3 Front Panel</b><br><br>"
+            "<b>NanoVNA Front Panel</b> (NanoVNA-F V3 / NanoVNA-H4 / NanoVNA SAA2 / LiteVNA 64)<br><br>"
+            "<b>Model</b> list (below the USB port): Auto names the instrument when it connects; the F-V3 and the "
+            "H4 share a USB id, so pick one of them there to get its range and screen size.<br>"
             "<b>Hard keys</b> open menus on the right side of the screen (or press F1-F8).<br>"
             "A parameter softkey makes it the <i>active function</i>: turn the <b>knob</b> (hover + mouse wheel, "
             "or drag), use ◀ ▶ for fine and ▲ ▼ for coarse steps, or type a value and pick a unit.<br><br>"
             "<b>Traces</b>: click a trace panel to make it active; click again on its plot to drop the marker.<br>"
+            "<b>LiteVNA 64</b>: same protocol as the SAA2, 50 kHz - 6.3 GHz, battery voltage in Device Info.<br>"
+            "<b>NanoVNA SAA2</b>: USB data is raw, so use Correction = App (the device cal is not "
+            "applied over USB). Port Ext → Power sets the ADF4350 level (above 140 MHz).<br>"
             "<b>Cal</b>: Correction = Device uses the NanoVNA's own cal. For app SOLT: measure Open, Short, Load "
             "(port 1), Thru (port 1→2), optional Isolation, then Done/Apply. The cal interpolates if you narrow "
             "the sweep inside the cal range.<br><br>"
@@ -2083,6 +2239,10 @@ class VNAPanel(QMainWindow):
 def main():
     ap = argparse.ArgumentParser(description=APP_NAME)
     ap.add_argument("--sim", action="store_true", help="use the built-in simulator")
+    ap.add_argument("--sim-saa2", action="store_true", help="simulator speaking the NanoVNA SAA2 binary protocol")
+    ap.add_argument("--saa2", action="store_true", help="force the NanoVNA SAA2 / LiteVNA protocol on --port")
+    ap.add_argument("--sim-lite", action="store_true", help="simulator of a LiteVNA 64 (same binary protocol)")
+    ap.add_argument("--litevna", action="store_true", help="force LiteVNA on --port (normally detected)")
     ap.add_argument("--port", help="serial port, e.g. COM9")
     ap.add_argument("--screenshot", help=argparse.SUPPRESS)
     args = ap.parse_args()

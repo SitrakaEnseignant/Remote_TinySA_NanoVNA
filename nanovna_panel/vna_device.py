@@ -1,14 +1,17 @@
 """
-NanoVNA-F V3 device layer: USB-CDC shell, simulator and worker thread.
+NanoVNA device layer: USB-CDC shell (NanoVNA-F V3 / H / H4), NanoVNA SAA2 binary protocol
+(saa2_device.py) and LiteVNA 64 on the same protocol (litevna64_device.py), simulators and worker thread.
 
 Shell protocol (NanoVNA family): send "<cmd>\r", device echoes the line, prints the
-reply, then the prompt "ch> ".
+reply, then the prompt "ch> " ("ch>" on NanoVNA-F V3 firmware 0.6.0; the space of older firmware
+is skipped by command(), which compares the echo after strip()).
   scan <start> <stop> <points> 7  ->  "<freq> <s11re> <s11im> <s21re> <s21im>" per line
   (older firmware: scan without mask, then "data 0" / "data 1" / "frequencies")
   cal on|off, save/recall <0..6>, pause/resume, capture (800x480 RGB565 LE)
 """
 import math
 import queue
+import re
 import threading
 import time
 
@@ -21,32 +24,107 @@ try:
 except ImportError:  # pragma: no cover
     serial = None
 
+from saa2_device import (PointsError, SAA2Transport, SAA2Emulator, V2Link, open_serial, is_saa2_port,
+                         probe_kind, LABEL_SAA2, ECAL_HINT, ecal_problem)
+from litevna64_device import LiteVNA64Transport, LiteVNA64Emulator, is_litevna
+
 ST_VID, ST_PID = 0x0483, 0x5740
-PROMPT = b"ch>"
+PROMPT = b"ch>"                   # NanoVNA-F V3 firmware 0.6.0 has no trailing space (upstream f287178)
 SIM_PORT = "Simulator"
-# Per-model settings (selected from the Model dropdown in vna_panel.py)
+SIM_SAA2_PORT = "Simulator (SAA2)"
+SIM_LITE_PORT = "Simulator (LiteVNA)"
+SIM_PORTS = (SIM_PORT, SIM_SAA2_PORT, SIM_LITE_PORT)
+LABEL_SHELL = "NanoVNA"
+
+# Per-instrument settings (Model list in vna_panel.py; NanoVNA-H4 entry from upstream PR #2 by StrontiumD).
+# The NanoVNA-F V3 and the NanoVNA-H4 share the USB id and the text protocol: the Model list decides,
+# or on "Auto" the "version" reply.  The NanoVNA SAA2 and the LiteVNA 64 identify themselves over USB.
 MODELS = {
-    "NanoVNA-F V3": dict(label="-F V3", range="1MHz-6GHz", title="NanoVNA-F V3 Front Panel",
-                         fmin=1e6, fmax=6e9, screen=(800, 480), preset=(1e6, 3e9)),
-    "NanoVNA-H4":   dict(label="-H4", range="50kHz-1.5GHz", title="NanoVNA-H4 Front Panel",
-                         fmin=50e3, fmax=1.5e9, screen=(480, 320), preset=(1e6, 1.5e9)),
+    "NanoVNA-F V3": dict(logo="NanoVNA", label="-F V3", range="1MHz-6GHz", title="NanoVNA-F V3 Front Panel",
+                         fmin=1e6, fmax=6e9, screen=(800, 480), preset=(1e6, 3e9), protocol="shell"),
+    "NanoVNA-H4":   dict(logo="NanoVNA", label="-H4", range="50kHz-1.5GHz", title="NanoVNA-H4 Front Panel",
+                         fmin=50e3, fmax=1.5e9, screen=(480, 320), preset=(1e6, 1.5e9), protocol="shell"),
+    "NanoVNA SAA2": dict(logo="NanoVNA", label=" SAA2", range="50kHz-4.4GHz", title="NanoVNA SAA2 Front Panel",
+                         fmin=50e3, fmax=4.4e9, screen=(320, 240), preset=(1e6, 3e9), protocol="saa2"),
+    "LiteVNA 64":   dict(logo="LiteVNA", label=" 64", range="50kHz-6.3GHz", title="LiteVNA 64 Front Panel",
+                         fmin=50e3, fmax=6.3e9, screen=(480, 320), preset=(1e6, 3e9), protocol="litevna"),
 }
-DEFAULT_MODEL = "NanoVNA-H4"      # model selected at startup (edit to "NanoVNA-F V3" if preferred)
+AUTO_MODEL = "Auto"               # generic "NanoVNA" until the instrument is chosen or identifies itself
+GENERIC = dict(logo="NanoVNA", label="", range="", title="NanoVNA Front Panel",
+               fmin=1e6, fmax=6e9, screen=(800, 480), preset=(1e6, 3e9), protocol=None)
+DEFAULT_MODEL = AUTO_MODEL        # model selected at startup (PR #2 used "NanoVNA-H4")
+KIND_MODEL = {"saa2": "NanoVNA SAA2", "litevna": "LiteVNA 64"}   # instruments identified over USB
+FMIN, FMAX = GENERIC["fmin"], GENERIC["fmax"]
+SCREEN = GENERIC["screen"]
+SHELL_CAPS = dict(kind="shell", device_cal=True, slots=True, capture=True, power=False,
+                  fmin=FMIN, fmax=FMAX, max_points=201)
 
 
-class PointsError(Exception):
-    pass
+def shell_model(version):
+    """NanoVNA-F V3 or NanoVNA-H4 from a shell "version" reply; None when the reply does not say."""
+    v = (version or "").upper()
+    if re.search(r"NANOVNA[-_ ]?H[-_ ]?4", v):
+        return "NanoVNA-H4"
+    if re.search(r"NANOVNA[-_ ]?F|F[-_ ]?V3", v):
+        return "NanoVNA-F V3"
+    return None
 
 
 def list_ports():
+    """[(device, description, label)]; label is LABEL_SHELL, LABEL_SAA2 or "" (unknown)."""
     out = []
     if serial is None:
         return out
     for p in serial.tools.list_ports.comports():
-        is_v = (p.vid == ST_VID and p.pid == ST_PID)
-        out.append((p.device, p.description or "", is_v))
+        if p.vid == ST_VID and p.pid == ST_PID:
+            label = LABEL_SHELL
+        elif is_saa2_port(p):
+            label = LABEL_SAA2
+        else:
+            label = ""
+        out.append((p.device, p.description or "", label))
     out.sort(key=lambda x: (not x[2], x[0]))
     return out
+
+
+def port_label(port):
+    for dev, _, label in list_ports():
+        if dev == port:
+            return label
+    return ""
+
+
+def open_v2(port=None, ser=None, model="auto"):
+    """Binary-protocol instrument: read its identity registers, then build the SAA2 or the LiteVNA transport."""
+    if ser is None:
+        ser = open_serial(port)
+    if model == "auto":
+        model = "litevna" if is_litevna(V2Link(ser).identify()) else "saa2"
+    return LiteVNA64Transport(ser=ser) if model == "litevna" else SAA2Transport(ser=ser)
+
+
+def open_transport(port, proto="auto"):
+    """Pick the protocol from the USB id, or probe the port when the id is unknown."""
+    if proto == "auto":
+        label = port_label(port)
+        if label == LABEL_SAA2:
+            proto = "saa2"
+        elif label == LABEL_SHELL:
+            proto = "shell"
+        else:
+            if serial is None:
+                raise RuntimeError("pyserial is not installed")
+            ser = serial.Serial(port, 115200, timeout=0.05, write_timeout=2)
+            try:
+                proto = probe_kind(ser) or "shell"
+            finally:
+                ser.close()
+            time.sleep(0.1)
+    if proto == "litevna":
+        return open_v2(port, model="litevna")
+    if proto == "saa2":
+        return open_v2(port)                           # SAA2 or LiteVNA, told apart by the firmware registers
+    return SerialTransport(port)
 
 
 def _floats(text, ncol):
@@ -65,6 +143,8 @@ def _floats(text, ncol):
 # --------------------------------------------------------------------------
 class SerialTransport:
     rx = b""
+    kind = "shell"
+    caps = SHELL_CAPS
 
     def __init__(self, port):
         if serial is None:
@@ -189,6 +269,8 @@ def abcd_to_s(m, z0=50.0):
 class SimTransport:
     """Synthetic NanoVNA with realistic port errors, for testing without hardware."""
     MAX_POINTS = 201
+    kind = "sim"
+    caps = dict(SHELL_CAPS, kind="sim", capture=True)
 
     def __init__(self):
         self.cal_on = True
@@ -273,11 +355,18 @@ class SimTransport:
         if n > self.MAX_POINTS or n < 11:
             raise PointsError("usage: scan {start(Hz)} {stop(Hz)} [points 11..%d] [outmask]" % self.MAX_POINTS)
         f = np.round(np.linspace(start, stop, n))
+        m11, m21 = self.measure(f, self.cal_on)
+        time.sleep(n / 600.0)
+        return f, m11, m21
+
+    def measure(self, f, corrected):
+        """Measured S11/S21 at f: ideal + noise if corrected, else through the port error model."""
+        n = len(f)
         s11, s21, s22 = self._dut(f)
         s12 = s21
         rng = np.random.default_rng()
         nz = lambda s: s * (rng.normal(size=n) + 1j * rng.normal(size=n))
-        if self.cal_on:
+        if corrected:
             m11 = s11 + nz(6e-4)
             m21 = s21 + nz(2.5e-4)
         else:
@@ -286,8 +375,7 @@ class SimTransport:
             m11 = e00 + e10e01 * gin / (1 - e11 * gin) + nz(6e-4)
             den = (1 - e11 * s11) * (1 - e22 * s22) - e11 * e22 * s21 * s12
             m21 = e30 + e10e32 * s21 / den + nz(2.5e-4)
-        time.sleep(n / 600.0)
-        return f, m11, m21
+        return m11, m21
 
     def capture(self, w, h):
         y, x = np.mgrid[0:h, 0:w]
@@ -305,10 +393,12 @@ class VNAWorker(QThread):
     reply = pyqtSignal(int, object)
     status = pyqtSignal(str)
 
-    def __init__(self, port, screen=(800, 480)):
+    def __init__(self, port, screen=SCREEN, proto="auto"):
         super().__init__()
         self.port = port
-        self.screen = screen   # device LCD size for the capture command
+        self.screen = screen          # shell instruments: LCD size for the capture command (per model, PR #2)
+        self.proto = proto            # auto | shell | saa2 (SAA2 or LiteVNA) | litevna
+        self.caps = dict(SHELL_CAPS)
         self.q = queue.Queue()
         self.lock = threading.Lock()
         self.sweep = (1e6, 1.5e9, 201)
@@ -317,6 +407,9 @@ class VNAWorker(QThread):
         self.single = False
         self._stop = False
         self.gen = 0          # bumps when sweep settings change so stale sweeps are dropped
+        self.retries = 0      # failed segments that were retried (Device Info shows them)
+        self.last_error = ""
+        self.stuck_points = 0  # SAA2: points of the last sweep stuck at S11 = 1 (device not in ECAL mode)
 
     def set_sweep(self, start, stop, n):
         with self.lock:
@@ -345,20 +438,36 @@ class VNAWorker(QThread):
         try:
             while True:
                 kind, arg, token = self.q.get_nowait()
-                if kind == "cmd":
-                    r = tr.command(arg)
-                else:
-                    w, h = self.screen
-                    r = (w, h, tr.capture(w, h))
+                try:
+                    if kind == "cmd":
+                        r = tr.command(arg)
+                    else:
+                        w, h = self.screen
+                        res = tr.capture(w, h)               # shell: raw bytes; SAA2: (w, h, bytes)
+                        r = res if isinstance(res, tuple) else (w, h, res)
+                except (NotImplementedError, ValueError) as e:   # unsupported on this device / bad argument
+                    self.status.emit(str(e))
+                    continue
                 if token is not None:
                     self.reply.emit(token, r)
         except queue.Empty:
             pass
 
+    def _open(self):
+        if self.port == SIM_PORT:
+            return SimTransport()
+        if self.port in (SIM_SAA2_PORT, SIM_LITE_PORT):
+            sim = SimTransport()                       # same DUT and port-error model, raw data
+            emulator = LiteVNA64Emulator if self.port == SIM_LITE_PORT else SAA2Emulator
+            emu = emulator(model=lambda f: sim.measure(f, False), dut_setter=lambda d: setattr(sim, "dut", d))
+            return open_v2(ser=emu)                    # identified like a real instrument
+        return open_transport(self.port, self.proto)
+
     def run(self):
         tr = None
         try:
-            tr = SimTransport() if self.port == SIM_PORT else SerialTransport(self.port)
+            tr = self._open()
+            self.caps = dict(tr.caps)
             ver = tr.command("version")
             self.connected.emit(ver)
         except Exception as e:
@@ -368,6 +477,8 @@ class VNAWorker(QThread):
             return
         reason = "Disconnected"
         errors = 0
+        warned = False        # an error message is on screen: say so when sweeps work again
+        ecal_warned = False
         try:
             while not self._stop:
                 self._drain(tr)
@@ -383,6 +494,7 @@ class VNAWorker(QThread):
                 t0 = time.perf_counter()
                 i0 = 0
                 ok = True
+                stuck = 0
                 while i0 < n and not self._stop:
                     m = min(self.chunk, n - i0)
                     if m < 11:                       # keep every segment >= 11 points
@@ -399,7 +511,13 @@ class VNAWorker(QThread):
                         raise RuntimeError("scan rejected: %s" % ex)
                     except (ValueError, TimeoutError) as ex:
                         errors += 1
-                        self.status.emit("Sweep error: %s (resyncing)" % ex)
+                        self.retries += 1
+                        self.last_error = str(ex)
+                        # A single failure that the retry fixes is not reported (the NanoVNA SAA2 often
+                        # misses its very first FIFO read after connecting); two in a row are.
+                        if errors >= 2:
+                            self.status.emit("Sweep error (%d in a row): %s - resyncing" % (errors, ex))
+                            warned = True
                         tr.resync()
                         if errors > 5:
                             raise
@@ -407,6 +525,7 @@ class VNAWorker(QThread):
                         break
                     s11[i0:i0 + m] = a
                     s21[i0:i0 + m] = b
+                    stuck += getattr(tr, "stuck_points", 0)
                     i0 += m
                     self._drain(tr)          # stay responsive between segments
                     if gen != self.gen:
@@ -415,6 +534,16 @@ class VNAWorker(QThread):
                 if ok and not self._stop:
                     self.single = False
                     self.sweep_ready.emit(f_all, s11, s21, time.perf_counter() - t0)
+                    if warned:
+                        self.status.emit("Sweeping again - the device recovered")
+                        warned = False
+                    self.stuck_points = stuck
+                    if ecal_problem(stuck, n):
+                        if not ecal_warned:
+                            self.status.emit(ECAL_HINT % (stuck, n))
+                            ecal_warned = True
+                    elif stuck == 0:
+                        ecal_warned = False
         except Exception as e:
             reason = "Connection lost: %s" % e
         finally:
