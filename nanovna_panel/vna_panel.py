@@ -24,7 +24,7 @@ from vna_device import (VNAWorker, list_ports, SIM_PORT, SIM_SAA2_PORT, SIM_LITE
                         FMIN, FMAX, MODELS, GENERIC, AUTO_MODEL, DEFAULT_MODEL, KIND_MODEL, shell_model)
 from saa2_device import POWER_DESC, ecal_problem
 from vna_cal import Calibration, interp_c
-from vna_widgets import PanelButton, Knob, PowerBar, PortConnector, ClickFrame, DPadCenter
+from vna_widgets import PanelButton, Knob, PowerBar, PortConnector, ClickFrame, DPadCenter, SplitHandle
 
 APP_NAME = GENERIC["title"]               # "NanoVNA Front Panel" until an instrument is chosen
 V2_KINDS = ("saa2", "litevna")            # binary-protocol instruments (saa2_device.py, litevna64_device.py)
@@ -422,6 +422,9 @@ class VNAPanel(QMainWindow):
         self.build_params()
         self.menus = self.build_menus()
         self.build_ui()
+        # explicit minimum: the content can no longer force the window to be wider than
+        # the screen, so the maximized window always fits it exactly
+        self.setMinimumSize(800, 600)
         self.relayout()
         self.render_menu()
         self.update_all()
@@ -476,12 +479,31 @@ class VNAPanel(QMainWindow):
         top.addStretch(1)
         left.addLayout(top)
 
+        # ---- screen, cut in two by a clickable divider (vna_widgets.SplitHandle):
+        #   left bezel half : traces (toolbar, trace panels, status bar)
+        #   divider         : 8 px, continues the bezel and the screen, blue arrow
+        #   right bezel half: on-screen menu column
+        # The cut costs 12 px (two 2 px screen frame lines + the 8 px rail); they are taken
+        # from the menu column (138 -> 126 px), so the traces keep their exact width and the
+        # brand strip, lower panel and control panel keep their exact place.
+        srow = QHBoxLayout()
+        srow.setSpacing(0)
         sb = QFrame()
         sb.setObjectName("screenBezel")
         sbl = QVBoxLayout(sb)
-        sbl.setContentsMargins(16, 14, 16, 14)
+        sbl.setContentsMargins(16, 14, 0, 14)      # 0 on the cut side
         sbl.addWidget(self.build_screen())
-        left.addWidget(sb, 1)
+        srow.addWidget(sb, 1)
+        self.split_handle = SplitHandle(width=8)
+        self.split_handle.clicked.connect(self.toggle_control_panel)
+        srow.addWidget(self.split_handle)
+        self.menu_bezel = QFrame()
+        self.menu_bezel.setObjectName("screenBezel")   # same QSS as the left half
+        mbl = QVBoxLayout(self.menu_bezel)
+        mbl.setContentsMargins(0, 14, 16, 14)      # 0 on the cut side
+        mbl.addWidget(self.build_menu_screen())
+        srow.addWidget(self.menu_bezel)
+        left.addLayout(srow, 1)
 
         low = QFrame()
         low.setObjectName("lowerPanel")
@@ -523,7 +545,24 @@ class VNAPanel(QMainWindow):
         left.addWidget(low)
         outer.addLayout(left, 1)
 
-        outer.addWidget(self.build_controls())
+        self.ctrl_panel = self.build_controls()
+        outer.addWidget(self.ctrl_panel)
+
+    def toggle_control_panel(self):
+        """Click on the divider: fold the menu column and the control panel (the traces
+        then fill the window, the divider goes to the right edge). Click again: back to the
+        initial layout. The window stays full screen."""
+        collapse = not self.menu_bezel.isHidden()
+        self.menu_bezel.setHidden(collapse)
+        self.ctrl_panel.setHidden(collapse)
+        self.split_handle.set_collapsed(collapse)
+        QTimer.singleShot(0, self.keep_full_screen)   # once the new layout is applied
+
+    def keep_full_screen(self):
+        """The window always fills the screen: maximized (title bar, close button and
+        taskbar stay visible). Called at start-up and after each click on the divider."""
+        if not self.isMaximized():
+            self.showMaximized()
 
     def build_screen(self):
         scr = QFrame()
@@ -586,9 +625,30 @@ class VNAPanel(QMainWindow):
         v.addWidget(st)
         h.addLayout(v, 1)
 
+        self.entry_box = QLabel(scr)
+        self.entry_box.setObjectName("entryBox")
+        self.entry_box.hide()
+        self.msg = QLabel(scr)
+        self.msg.setObjectName("msgBox")
+        self.msg.hide()
+        self.msg_timer = QTimer(self)
+        self.msg_timer.setSingleShot(True)
+        self.msg_timer.timeout.connect(self.msg.hide)
+        return scr
+
+    def build_menu_screen(self):
+        """On-screen menu column, in its own black #screen frame (same QSS as the trace
+        screen) so it can sit on the right-hand side of the divider."""
+        scr = QFrame()
+        scr.setObjectName("screen")
+        h = QHBoxLayout(scr)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+
+        # 126 px: the menu column lends 12 px to the divider (see build_ui)
         mc = QFrame()
         mc.setObjectName("menuCol")
-        mc.setFixedWidth(138)
+        mc.setFixedWidth(126)
         ml = QVBoxLayout(mc)
         ml.setContentsMargins(0, 0, 0, 4)
         ml.setSpacing(0)
@@ -629,16 +689,6 @@ class VNAPanel(QMainWindow):
         pr.addWidget(self.page_btn)
         ml.addLayout(pr)
         h.addWidget(mc)
-
-        self.entry_box = QLabel(scr)
-        self.entry_box.setObjectName("entryBox")
-        self.entry_box.hide()
-        self.msg = QLabel(scr)
-        self.msg.setObjectName("msgBox")
-        self.msg.hide()
-        self.msg_timer = QTimer(self)
-        self.msg_timer.setSingleShot(True)
-        self.msg_timer.timeout.connect(self.msg.hide)
         return scr
 
     def build_controls(self):
@@ -1017,7 +1067,7 @@ class VNAPanel(QMainWindow):
             txt = "%s:  <b>%s</b>" % (self.active.name, self.active.fmt(self.active.get()))
         self.entry_box.setText(txt)
         self.entry_box.adjustSize()
-        x = (self.screen.width() - 138 - self.entry_box.width()) // 2
+        x = (self.screen.width() - self.entry_box.width()) // 2      # centred over the traces
         self.entry_box.move(max(4, x), 34)
         self.entry_box.show()
         self.entry_box.raise_()
@@ -2251,8 +2301,8 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setStyleSheet(QSS)
     w = VNAPanel(args)
-    w.resize(1560, 820)
-    w.show()
+    w.resize(1560, 820)          # size used if the window is ever restored
+    w.showMaximized()            # full screen at start-up (see keep_full_screen)
     if os.environ.get("DEMO"):
         def demo():
             w.set_range(500e6, 1.5e9)

@@ -1,7 +1,7 @@
-"""Painted front-panel widgets for the VNA panel."""
+"""Painted front-panel widgets for the VNA panel (knob, power bar, ports, split handle)."""
 import math
 
-from PyQt6.QtCore import Qt, QPointF, QRectF, pyqtSignal, QSize
+from PyQt6.QtCore import Qt, QPoint, QPointF, QRectF, pyqtSignal, QSize, QEvent
 from PyQt6.QtGui import (QPainter, QColor, QPen, QRadialGradient, QLinearGradient,
                          QFont, QPolygonF, QPainterPath)
 from PyQt6.QtWidgets import QWidget, QAbstractButton, QPushButton, QFrame
@@ -261,4 +261,172 @@ class PortConnector(QWidget):
         p.setPen(QPen(QColor("#222"), 1))
         p.setBrush(QColor("#f5c400"))
         p.drawPolygon(QPolygonF([QPointF(tx, ty + 12), QPointF(tx + 14, ty + 12), QPointF(tx + 7, ty)]))
+        p.end()
+
+
+class SplitHandle(QWidget):
+    """Camouflaged divider between the trace screen and the on-screen menu.
+
+    It continues the dark bezel and the screen (grey frame line, black inside), so only
+    its blue arrow stands out: ▶ = click (on the arrow or anywhere on the rail) to fold
+    the menu and the control panel (the traces then fill the window), ◀ = click to bring
+    them back.
+    """
+    clicked = pyqtSignal()
+
+    BEZEL = QColor("#1d1f23")     # #screenBezel background (QSS)
+    BEZEL_R = 10                  # #screenBezel border radius (QSS)
+    FRAME = QColor("#4b5563")     # #screen border colour (QSS)
+    FRAME_W = 2                   # #screen border width (QSS)
+    BAND = QColor("#000000")      # #screen background (QSS)
+    ARROW = QColor("#3b7ddd")     # the panel's own blue (key hover border)
+
+    def __init__(self, parent=None, width=8):
+        super().__init__(parent)
+        self._w = width
+        self.setFixedWidth(width)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)   # keys keep going to the main window
+        self.setCursor(Qt.CursorShape.PointingHandCursor)
+        self.collapsed = False
+        self._pressed = False
+        self._bezel = None      # bezel half on the left of the rail
+        self._screen = None     # black screen frame inside it
+        self._edges = None      # overlay that hides the cut on the neighbours' side
+        self._update_tip()
+
+    def sizeHint(self):
+        return QSize(self._w, 200)
+
+    def _neighbours(self):
+        """The bezel half just left of the rail (#screenBezel) and the screen frame
+        inside it (#screen); found once, then followed when they move or resize."""
+        if self._bezel is None:
+            win = self.window()
+            x0 = self.mapTo(win, QPoint(0, 0)).x()
+            for f in win.findChildren(QFrame, "screenBezel"):
+                if f.isVisible() and f.mapTo(win, QPoint(f.width(), 0)).x() == x0:
+                    scr = f.findChild(QFrame, "screen")
+                    if scr is not None:
+                        self._bezel, self._screen = f, scr
+                        for w in (f, scr):
+                            w.installEventFilter(self)      # repaint when they move or resize
+                    break
+        return self._bezel, self._screen
+
+    def eventFilter(self, obj, e):
+        if e.type() in (QEvent.Type.Resize, QEvent.Type.Move):
+            self._refresh()
+        return False
+
+    def _refresh(self):
+        self.update()
+        if self._edges is not None:
+            self._edges.update()
+
+    def zones(self):
+        """(bezel top, bezel height, screen top, screen height) in rail coordinates,
+        or None when folded (then only the arrow is drawn)."""
+        if self.collapsed:
+            return None
+        bezel, screen = self._neighbours()
+        if bezel is None or screen is None or screen.height() <= 0:
+            return None
+        win = self.window()
+        y0 = self.mapTo(win, QPoint(0, 0)).y()
+        return (bezel.mapTo(win, QPoint(0, 0)).y() - y0, bezel.height(),
+                screen.mapTo(win, QPoint(0, 0)).y() - y0, screen.height())
+
+    # the overlay covers BEZEL_R px on each side of the rail, above the two bezel halves
+    def _sync_edges(self):
+        parent = self.parentWidget()
+        if parent is None:
+            return
+        if self._edges is None or self._edges.parentWidget() is not parent:
+            self._edges = _RailEdges(self, parent)
+        r = self.BEZEL_R
+        self._edges.setGeometry(self.geometry().adjusted(-r, 0, r, 0))
+        self._edges.show()
+        self._edges.raise_()
+        self._edges.update()
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._sync_edges()
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._sync_edges()
+
+    def moveEvent(self, e):
+        super().moveEvent(e)
+        self._sync_edges()
+
+    def set_collapsed(self, collapsed):
+        self.collapsed = bool(collapsed)
+        self._update_tip()
+        self._refresh()
+
+    def _update_tip(self):
+        self.setToolTip("Show the menu and control panel" if self.collapsed
+                        else "Hide the menu and control panel")
+
+    def mousePressEvent(self, e):
+        self._pressed = e.button() == Qt.MouseButton.LeftButton
+
+    def mouseReleaseEvent(self, e):
+        # click = press and release inside the rail
+        if self._pressed and self.rect().contains(e.position().toPoint()):
+            self.clicked.emit()
+        self._pressed = False
+
+    def paintEvent(self, e):
+        p = QPainter(self)
+        w = self.width()
+        z = self.zones()
+        if z is not None:
+            btop, bh, stop, sh = z
+            fw = self.FRAME_W
+            p.fillRect(QRectF(0, btop, w, bh), self.BEZEL)                  # bezel between the halves
+            p.fillRect(QRectF(0, stop, w, sh), self.FRAME)                  # screen frame line (top/bottom)
+            p.fillRect(QRectF(0, stop + fw, w, sh - 2 * fw), self.BAND)     # black screen inside
+
+        # blue arrow inside the rail, vertically centred (7 x 12 px in an 8 px rail)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        r = QRectF(self.rect()).adjusted(0.5, 0.5, -0.5, -0.5)
+        c = r.center()
+        hw = max(1.5, min(r.width() / 2, 3.5))   # half width of the arrow
+        hh = hw * 1.7                            # half height of the arrow
+        d = -1 if self.collapsed else 1     # ◀ when collapsed, ▶ otherwise
+        tri = QPolygonF([QPointF(c.x() - d * hw, c.y() - hh),
+                         QPointF(c.x() - d * hw, c.y() + hh),
+                         QPointF(c.x() + d * hw, c.y())])
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(self.ARROW)
+        p.drawPolygon(tri)
+        p.end()
+
+
+class _RailEdges(QWidget):
+    """Overlay of SplitHandle, above the two bezel halves: squares their rounded corners
+    at the cut and blackens the screen frame line on each side of the rail, so the bezel
+    and the screen look continuous. Paints nothing over the rail itself; ignores the mouse."""
+
+    def __init__(self, rail, parent):
+        super().__init__(parent)
+        self.rail = rail
+        self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents)
+        self.setFocusPolicy(Qt.FocusPolicy.NoFocus)
+
+    def paintEvent(self, e):
+        z = self.rail.zones()                 # same y origin as the rail
+        if z is None:
+            return
+        btop, bh, stop, sh = z
+        R, w, fw = SplitHandle.BEZEL_R, self.rail.width(), SplitHandle.FRAME_W
+        p = QPainter(self)
+        for x0 in (0, R + w):                 # left strip, right strip
+            p.fillRect(QRectF(x0, btop, R, R), SplitHandle.BEZEL)              # top corner
+            p.fillRect(QRectF(x0, btop + bh - R, R, R), SplitHandle.BEZEL)     # bottom corner
+        p.fillRect(QRectF(R - fw, stop + fw, fw, sh - 2 * fw), SplitHandle.BAND)   # left frame line
+        p.fillRect(QRectF(R + w, stop + fw, fw, sh - 2 * fw), SplitHandle.BAND)    # right frame line
         p.end()

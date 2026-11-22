@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QFrame, QLabel,
                              QDialog, QPlainTextEdit, QPushButton, QSizePolicy)
 
 from device import DeviceWorker, list_ports, MODELS, SIM_PORT
-from widgets import PanelButton, Knob, PowerButton, Connector, ClickFrame
+from widgets import PanelButton, Knob, PowerButton, Connector, ClickFrame, SplitHandle
 
 APP_NAME = "tinySA Front Panel"
 SLOTS = 7          # softkeys per menu page
@@ -208,6 +208,9 @@ class FrontPanel(QMainWindow):
 
         self.menus = self.build_menus()
         self.build_ui()
+        # explicit minimum: the content can no longer force the window to be wider than
+        # the screen, so the maximized window always fits it exactly
+        self.setMinimumSize(800, 600)
         self.apply_model()
         self.update_axes()
         self.render_menu()
@@ -239,12 +242,30 @@ class FrontPanel(QMainWindow):
         root = QWidget()
         root.setObjectName("bezel")
         self.setCentralWidget(root)
-        outer = QVBoxLayout(root)
+        # Two panes side by side, separated by a clickable, camouflaged rail (blue ▶ / ◀ arrow).
+        # The cut runs through the screen, between the trace area and the menu column:
+        #   left_pane  : brand strip + side keys + trace screen (status, plot, table) + power/port
+        #   right_pane : hint + menu column + softkeys + control panel + connectors
+        # Margins / spacings reproduce the former single-window layout. The cut costs 16 px
+        # (two 3 px screen borders + two 1 px bezel borders + the 8 px rail); they are taken
+        # from the menu column (118 -> 102 px), so the trace area keeps its exact width (the
+        # window keeps its minimum width) and the softkeys, control panel, tops and bottoms
+        # stay exactly where they were.
+        outer = QHBoxLayout(root)
         outer.setContentsMargins(18, 10, 18, 10)
-        outer.setSpacing(6)
+        outer.setSpacing(0)
+
+        self.left_pane = QWidget()
+        lp = QVBoxLayout(self.left_pane)
+        lp.setContentsMargins(0, 0, 0, 0)
+        lp.setSpacing(6)                  # old gap brand strip -> screen
+        outer.addWidget(self.left_pane, 1)
 
         # --- brand strip
-        top = QHBoxLayout()
+        self.top_row = QWidget()
+        top = QHBoxLayout(self.top_row)
+        top.setContentsMargins(0, 0, 0, 0)
+        top.setSpacing(6)                 # old value (inherited from the old outer layout)
         brand = QLabel("tinySA")
         brand.setObjectName("brand")
         self.model_lbl = QLabel("ULTRA")
@@ -256,14 +277,11 @@ class FrontPanel(QMainWindow):
         for w in (brand, self.model_lbl, tag, self.range_lbl):
             top.addWidget(w)
         top.addStretch(1)
-        hint = QLabel("Hover the knob and use the mouse wheel  |  type numbers on the keyboard  |  click the trace to place a marker")
-        hint.setObjectName("hint")
-        top.addWidget(hint)
-        outer.addLayout(top)
+        lp.addWidget(self.top_row)
 
         main = QHBoxLayout()
-        main.setSpacing(10)
-        outer.addLayout(main, 1)
+        main.setSpacing(10)               # side keys <-> screen, unchanged
+        lp.addLayout(main, 1)
 
         # --- left side keys
         left = QVBoxLayout()
@@ -283,18 +301,17 @@ class FrontPanel(QMainWindow):
         left.addStretch(1)
         main.addLayout(left)
 
-        # --- screen + softkeys + bottom (power, port)
+        # --- trace screen (left half of the bezel) + bottom (power, port)
         mid = QVBoxLayout()
         sb = QFrame()
         sb.setObjectName("screenBezel")
         sbl = QHBoxLayout(sb)
-        sbl.setContentsMargins(14, 14, 10, 14)
-        sbl.setSpacing(12)
+        sbl.setContentsMargins(14, 14, 0, 14)   # 0 on the cut side
         sbl.addWidget(self.build_screen(), 1)
-        sbl.addLayout(self.build_softkeys())
         mid.addWidget(sb, 1)
 
         bot = QHBoxLayout()
+        self._bot_layout = bot
         bot.setContentsMargins(20, 6, 0, 0)
         self.power = PowerButton()
         self.power.clicked.connect(self.toggle_connect)
@@ -326,16 +343,84 @@ class FrontPanel(QMainWindow):
         mid.addLayout(bot)
         main.addLayout(mid, 1)
 
-        # --- control panel
-        right = QVBoxLayout()
-        right.addWidget(self.build_control_panel())
+        # --- divider: 8 px rail, black where it touches the screen, with a blue arrow,
+        #     click = fold / unfold the right pane
+        self.split_handle = SplitHandle(width=8)
+        self.split_handle.clicked.connect(self.toggle_control_panel)
+        outer.addWidget(self.split_handle)
+
+        # --- right pane: menu column + softkeys (right half of the bezel) + control panel
+        self.right_pane = QWidget()
+        right = QVBoxLayout(self.right_pane)
+        right.setContentsMargins(0, 0, 0, 0)
+        right.setSpacing(6)               # hint -> panels = brand strip -> screen
+        self.hint_lbl = QLabel("Hover the knob and use the mouse wheel  |  type numbers on the keyboard  |  click the trace to place a marker")
+        self.hint_lbl.setObjectName("hint")
+        self.hint_lbl.setAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+        self.hint_lbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)  # never widens the pane
+        right.addWidget(self.hint_lbl)
+
+        row = QHBoxLayout()
+        row.setSpacing(10)                # bezel <-> control panel, as before
+        right.addLayout(row, 1)
+
+        mcol = QVBoxLayout()
+        mcol.setSpacing(10)               # same as "mid" on the left: bezel -> bottom row
+        sb2 = QFrame()
+        sb2.setObjectName("screenBezel")  # same QSS as the left half
+        sbl2 = QHBoxLayout(sb2)
+        sbl2.setContentsMargins(0, 14, 10, 14)  # 0 on the cut side
+        sbl2.setSpacing(12)               # menu column <-> softkeys, as before
+        sbl2.addWidget(self.build_menu_screen())
+        sbl2.addLayout(self.build_softkeys())
+        mcol.addWidget(sb2, 1)
+        self.bot_pad = QWidget()          # empty, same height as the power/port row on the left
+        mcol.addWidget(self.bot_pad)
+        row.addLayout(mcol)
+
+        rc = QVBoxLayout()
+        rc.setSpacing(10)                 # old column spacing (inherited from "main"), also used by conns
+        rc.addWidget(self.build_control_panel())
         conns = QHBoxLayout()
         conns.addStretch(1)
         conns.addWidget(Connector("CAL OUTPUT 50Ω", "Calibration / generator"))
         conns.addSpacing(30)
         conns.addWidget(Connector("RF 50Ω", "Input / output"))
-        right.addLayout(conns)
-        main.addLayout(right)
+        rc.addLayout(conns)
+        row.addLayout(rc)
+        outer.addWidget(self.right_pane)
+
+        root.ensurePolished()
+        self._sync_pane_rows()
+
+    def _sync_pane_rows(self):
+        """Keep both panes on the same horizontal lines:
+        - header rows get the height of the tallest one (as the old single row did),
+        - the empty pad under the right bezel gets the height of the power/port row,
+        so both halves of the bezel start and end on the same line."""
+        h = max(self.top_row.sizeHint().height(), self.hint_lbl.sizeHint().height())
+        self.top_row.setFixedHeight(h)
+        self.hint_lbl.setFixedHeight(h)
+        self.bot_pad.setFixedHeight(self._bot_layout.sizeHint().height())
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        self._sync_pane_rows()            # fonts from the stylesheet are applied for sure here
+
+    def toggle_control_panel(self):
+        """Click on the divider: fold the right pane (menu column, softkeys, control panel);
+        the trace screen then fills the window and the rail goes to the right edge.
+        Click again: back to the initial layout."""
+        collapse = not self.right_pane.isHidden()
+        self.right_pane.setHidden(collapse)
+        self.split_handle.set_collapsed(collapse)
+        QTimer.singleShot(0, self.keep_full_screen)   # once the new layout is applied
+
+    def keep_full_screen(self):
+        """The window always fills the screen: maximized (title bar, close button and
+        taskbar stay visible). Called at start-up and after each click on the divider."""
+        if not self.isMaximized():
+            self.showMaximized()
 
     # ---------------------------------------------------------------- screen
     def build_screen(self):
@@ -472,16 +557,31 @@ class FrontPanel(QMainWindow):
         self.tbl.setTextFormat(Qt.TextFormat.RichText)
         self.tbl.setFixedHeight(118)
         self.tbl.setAlignment(Qt.AlignmentFlag.AlignTop | Qt.AlignmentFlag.AlignLeft)
+        # the peak table follows the screen width (100 % wide, see the table builder)
+        # and never imposes its own: showing it must not widen the window
+        self.tbl.setWordWrap(True)
+        self.tbl.setSizePolicy(QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Fixed)
         self.tbl_hdr.hide()
         self.tbl.hide()
         cv.addWidget(self.tbl_hdr)
         cv.addWidget(self.tbl)
         h.addLayout(cv, 1)
+        return scr
 
-        # on-screen menu column
+    def build_menu_screen(self):
+        """On-screen menu column, in its own black #screen frame (same QSS as the
+        trace screen) so it can live on the right-hand side of the divider."""
+        scr = QFrame()
+        scr.setObjectName("screen")
+        h = QHBoxLayout(scr)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+
+        # on-screen menu column (102 px: it lends 16 px to the divider, see build_ui;
+        # the longest value, e.g. "108.000000 MHz", still fits)
         mc = QFrame()
         mc.setObjectName("menuCol")
-        mc.setFixedWidth(118)
+        mc.setFixedWidth(102)
         ml = QVBoxLayout(mc)
         ml.setContentsMargins(0, 0, 0, 0)
         ml.setSpacing(0)
@@ -1769,10 +1869,14 @@ class FrontPanel(QMainWindow):
                 self.pk_text.append(t)
             rows = []
             for n, i in enumerate(order):
-                rows.append((n + 1, fmt_freq(self.freqs[i]), "%.2f dBm" % self.trace[i]))
-            html = ['<table cellspacing="0" cellpadding="1" style="color:#e8e8e8;font-size:8.5pt">',
-                    '<tr style="font-weight:bold"><td width=50>&nbsp;&nbsp;Peak</td><td width=150>X Axis</td><td width=100>Amp</td>'
-                    '<td width=50>&nbsp;&nbsp;Peak</td><td width=150>X Axis</td><td width=100>Amp</td></tr>']
+                # &nbsp; keeps "106.463252 MHz" / "-56.34 dBm" on one line
+                rows.append((n + 1, fmt_freq(self.freqs[i]).replace(" ", "&nbsp;"),
+                             ("%.2f dBm" % self.trace[i]).replace(" ", "&nbsp;")))
+            # same proportions as the former fixed 50/150/100 px columns, but relative to
+            # the screen width, so the table fits the screen instead of widening the window
+            html = ['<table width="100%" cellspacing="0" cellpadding="1" style="color:#e8e8e8;font-size:8.5pt">',
+                    '<tr style="font-weight:bold"><td width="8%">&nbsp;&nbsp;Peak</td><td width="25%">X&nbsp;Axis</td><td width="17%">Amp</td>'
+                    '<td width="8%">&nbsp;&nbsp;Peak</td><td width="25%">X&nbsp;Axis</td><td width="17%">Amp</td></tr>']
             for r in range(5):
                 cells = ""
                 for c in (r, r + 5):
@@ -1867,8 +1971,8 @@ def main():
     app.setApplicationName(APP_NAME)
     app.setStyleSheet(QSS)
     w = FrontPanel(args)
-    w.resize(1500, 800)
-    w.show()
+    w.resize(1500, 800)          # size used if the window is ever restored
+    w.showMaximized()            # full screen at start-up (see keep_full_screen)
     if os.environ.get("DEMO"):
         def demo():
             w.set_center(700.01e6); w.set_span(500e3); w.set_rbw(3)
